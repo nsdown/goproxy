@@ -3,6 +3,7 @@ package autorange
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"strconv"
 	"strings"
@@ -158,82 +159,45 @@ func (f *Filter) Response(ctx context.Context, resp *http.Response) (context.Con
 	resp.Header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
 	resp.Header.Del("Content-Range")
 
-	r, w := AutoPipe(f.Threads)
+	pipe := helpers.NewFragmentPipe(resp.ContentLength)
 
-	go func(w *autoPipeWriter, filter filters.RoundTripFilter, req0 *http.Request, start, length int64) {
-		glog.V(2).Infof("AUTORANGE begin rangefetch for %#v by using %#v", req0.URL.String(), filter.FilterName())
+	go func() {
+		var resp *http.Response
+		var req *http.Request
+		var data []byte
+		var err error
 
-		req, err := http.NewRequest(req0.Method, req0.URL.String(), nil)
-		if err != nil {
-			glog.Warningf("AUTORANGE http.NewRequest(%#v) error: %#v", req, err)
-			return
-		}
-
-		for key, values := range req0.Header {
-			for _, value := range values {
-				req.Header.Add(key, value)
-			}
-		}
-
-		if err := w.WaitForReading(); err != nil {
-			return
-		}
-		var index uint32
-		for {
-			if w.FatalErr() {
+		pos := end + 1
+		failures := 0
+		for pos < length {
+			if failures > 10 {
+				pipe.CloseWithError(err)
 				break
 			}
-			if start > length-1 {
-				// tell reader io.EOF
-				w.Close()
-				break
-			}
-			//FIXME: make this configurable!
-			if w.Len() > 128*1024*1024 {
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
 
-			//end := start + int64(f.BufSize-1)
-			end := start + int64(1024<<10-1)
-			if end > length-1 {
-				end = length - 1
+			req = helpers.CloneRequest(resp.Request)
+			pos1 := pos + int64(f.Config.MaxSize)
+			if pos1 > length-1 {
+				pos1 = length - 1
 			}
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", pos, pos1))
 
-			_, resp, err := filter.RoundTrip(nil, req)
+			_, resp, err = f1.RoundTrip(req.Context(), req)
 			if err != nil {
-				glog.Warningf("AUTORANGE %#v.RoundTrip(%v) error: %#v", filter, req, err)
-				time.Sleep(1 * time.Second)
+				failures += 1
+				time.Sleep(500 * time.Millisecond)
 				continue
 			}
-			if resp.StatusCode != http.StatusPartialContent {
-				if resp.StatusCode >= http.StatusBadRequest {
-					time.Sleep(1 * time.Second)
-				}
-				continue
+			data, err = ioutil.ReadAll(resp.Body)
+			if err != nil {
+				failures += 1
 			}
-
-			w.ThreadHello()
-			go func(index uint32, resp *http.Response) {
-				defer resp.Body.Close()
-				defer w.ThreadBye() // TODO: launch it as soon as iocopy over?
-
-				piper := w.NewPiper(index)
-				_, err := helpers.IoCopy(piper, resp.Body)
-				if err != nil {
-					glog.Warningf("AUTORANGE helpers.IoCopy(%#v) error: %#v", resp.Body, err)
-					piper.EIndex()
-				}
-				piper.WClose()
-			}(index, resp)
-
-			start = end + 1
-			index++
+			pipe.Write(data, pos)
+			pos += int64(len(data))
 		}
-	}(w, f1, resp.Request, end+1, length)
+	}()
 
-	resp.Body = helpers.NewMultiReadCloser(resp.Body, r)
+	resp.Body = helpers.NewMultiReadCloser(resp.Body, pipe)
 
 	return ctx, resp, nil
 }
